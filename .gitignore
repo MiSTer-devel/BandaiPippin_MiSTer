@@ -1,0 +1,43 @@
+# Downloaded third-party material (not committed)
+scratch/
+scratch.zip
+
+# ROM disassembly listings: committed as disasm/disasm.tar.xz
+# (tools/rom/pack.py unpack to extract, pack to rebuild)
+disasm/*/
+# cputest build outputs
+cputest/ppc603.vec
+cputest/*.hda
+cputest/macapp/build/
+cputest/super/super603.bin
+cputest/**/__pycache__/
+cputest/envelope/
+cputest/probe/build/
+
+# Quartus outputs (as MacPPC7300 ignores them)
+db/
+greybox_tmp/
+incremental_db/
+output_files/
+simulation/
+hc_output/
+scaler/
+hps_isw_handoff/
+vip/
+PLLJ_PLLSPE_INFO.txt
+*.qdf
+*.rpt
+*.smsg
+*.summary
+*.done
+*.jdi
+*.pin
+*.sof
+*.qws
+*.ppf
+*.ddb
+build_id.v
+c5_pin_model_dump.txt
+*.sopcinfo
+jtag.cdf
+syn/mister_host
