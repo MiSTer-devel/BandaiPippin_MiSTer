@@ -1,0 +1,942 @@
+//============================================================================
+//
+//  BandaiPippin: the Bandai Pippin (@WORLD, Atmark), designed by Apple, for MiSTer
+//  (the top level from MacPPC7300's, 21ba191)
+//
+//  This program is free software; you can redistribute it and/or modify it
+//  under the terms of the GNU General Public License as published by the Free
+//  Software Foundation; either version 2 of the License, or (at your option)
+//  any later version.
+//
+//  This program is distributed in the hope that it will be useful, but WITHOUT
+//  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+//  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+//  more details.
+//
+//  You should have received a copy of the GNU General Public License along
+//  with this program; if not, write to the Free Software Foundation, Inc.,
+//  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+//
+//============================================================================
+//
+//  Clocks from one PLL (rtl/pll.v), MacPPC7300's:
+//    clk_cpu  70 MHz   the CPU (DSPPC603) and the machine (Pippin_system); a real
+//                      Pippin runs at 66, its time base at 16.5 MHz (kept here)
+//    clk_mem  100 MHz  the SDRAM controller, hps_io, the ROM upload, the VRAM in
+//                      DDR3 and Taos's scan-out; also the video clock
+//  (outclk_0, 20 MHz, is not used.)
+//
+//  The picture is Taos's scan-out at the timing the ROM set for the console's
+//  video switch (an OSD choice, at the next reset): NTSC (the default, 480i at
+//  15.7 kHz: VGA_F1 the field), VGA (640 x 480 at 31 kHz) or PAL.
+//
+//  The machine is held in reset while RESET, the OSD's reset or the button is
+//  down, while the SDRAM is not ready, while a ROM is being uploaded, until a
+//  ROM has been uploaded, and for a moment after the RAM size changes. Then
+//  Cuda starts, and holds the CPU in reset until its firmware has powered the
+//  machine up (about 1.3 s). The ROM goes into the top 4 MB of the SDRAM board
+//  (32, 64 or 128 MB, as the Main reports it), written byte by byte from the
+//  OSD's file upload (index 1, or index 0: a boot.rom in the core's folder is
+//  loaded at start). RAM: 5 MB (the retail Pippin's: 4 MB at 0, 1 MB at 16
+//  MB), or 13 and 21 MB with the expansion banks at 32 and 48 MB (a 64 MB
+//  board or larger: the SDRAM offset is the physical address).
+//
+//  The CD-ROM is block slot 4, through the Main's Mac CD layer (Main_MiSTer
+//  branch pippin-cdrom adds this core's name to the Mac SCSI family).
+//
+//  The MiSTer's UART is the machine's modem port (the ESCC's channel A).
+//
+//============================================================================
+
+module emu
+(
+	`include "sys/emu_ports.vh"
+);
+
+// The CPU at 70 MHz, MacPPC7300's proven clocking (a real Pippin's 603 runs at 66; the time
+// base keeps the Pippin's 16.5 MHz whatever the CPU's clock). No speed option: the PLL is never
+// reconfigured.
+localparam int SPEED = 70;
+localparam int CPU_MHZ = 66;               // 66 (66.667 MHz, a 800 MHz VCO / 12: the Pippin's own; the 66 MHz work, 2026-10-24),
+                                           // 70, 100, or 58 (58.333 MHz, a 700 MHz VCO / 12)
+localparam int CPU_HZ  = CPU_MHZ == 58 ? 58_333_333 : CPU_MHZ == 66 ? 66_666_667 : CPU_MHZ * 1_000_000;
+localparam int L2_KB = 0;               // the Pippin has no L2 cache
+localparam int TRACE = 0;               // 1: the DDR3 trace (syn\mister.py trace), for debugging builds
+localparam int SOUND_IN_DMA = 0;        // 1: DMA channel 9 (sound in, which records silence) a real channel
+localparam int PERF = 0;                // 1: the CPU's performance counters, into the trace (syn\perf.py; needs TRACE)
+localparam int SND_TRACE = 0;           // 1: the codec's output frames into the trace (syn\sndtrace.py; needs TRACE)
+// The stall hunt's instruments (2026-10-21/22), each its own switch so that a PERF build does not
+// carry them: the CPU's instruction capture (kind 19, syn\capview.py; needs PERF; its trigger and
+// watched line are DSPPC603's CAP_* parameters), the dense PERF window (256-cycle samples for 20 ms
+// from SWIM3's interrupt being enabled; needs PERF), the memory-port trace of one RAM line
+// (Pippin_machine TRACE_RAM_A) and the SDRAM controller's diagnostic word that goes with it
+localparam int CAPTURE = 0;
+localparam int DENSE = 0;
+localparam int TRACE_RAM = 0;
+localparam int TRACE_FL = 0;            // the save flash's accesses and image transfers (needs TRACE; 2026-10-22)
+
+///////// Default values for ports not used in this core /////////
+
+assign ADC_BUS  = 'Z;
+assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
+
+assign VGA_SL = 0;
+assign VGA_F1 = vid_field;               // Taos's interlaced field (NTSC, PAL); 0 for VGA
+assign VGA_SCALER  = 0;
+assign VGA_DISABLE = 0;
+assign HDMI_FREEZE = 0;
+assign HDMI_BLACKOUT = 0;
+assign HDMI_BOB_DEINT = 0;
+
+// AWACS's samples, signed; they change in the CPU's clock at the sample
+// rate, and the framework's audio input keeps a value only once it has seen
+// it twice in its own clock
+wire [15:0] snd_left, snd_right;
+wire signed [15:0] cd_left, cd_right; // the CD-ROM drive's audio, likewise
+assign AUDIO_S = 1;
+assign AUDIO_MIX = 0;
+
+wire   disk_busy;                     // a block moving to or from an image (the memory clock's side syncs it)
+reg    [1:0] disk_led_s;
+always @(posedge clk_mem) disk_led_s <= {disk_led_s[0], disk_busy};
+assign LED_DISK = {1'b0, disk_led_s[1]};
+assign LED_POWER = 0;
+assign BUTTONS = 0;
+
+//////////////////////////////////////////////////////////////////
+
+wire [1:0] ar = status[122:121];         // the aspect ratio (video_freak, below)
+
+`include "build_id.v"
+localparam CONF_STR = {
+	// the OSD standard of the computer cores (hp9000-715's docs/osd-standard.md): the media
+	// and Load ROM, Memory, the pages (P2 Video, P3 Input, P4 Audio, P5 Advanced), then
+	// "Changes pending" and Apply and reset; every setting but Input's waits for the reset.
+	// The status bits are those of the earlier layout, so saved settings carry over.
+	"Pippin;UART115200:57600:38400:19200:9600,MIDI;",
+	"-;",
+	// the CD-ROM on slot 4 (the Main's Mac CD layer), the drive the Pippin boots from; SC,
+	// so the Main remembers the disc
+	"SC4,ISOTO*CUEBINCHD,Game disc (CD-ROM);",
+	// the console's eject button (Pippin_taos GPIO 27): Mac OS ejects the disc and restarts the
+	// Pippin, the tray open; choosing a disc above puts it in and closes the tray
+	"R[38],Eject disc;",
+	// the save flash (Pippin_flash), 128 KB, and Grand Central's 8 KB NVRAM kept in an image on
+	// slot 2 (Pippin_nvsave): 136 KB keeps both, 128 KB the flash alone
+	"SC2,SAV,Save file;",
+	// a SCSI hard disk on ID 0 (Pippin_scsidisk, block slot 0; the Mac cores' target), a data
+	// disk beside the CD (the ROM boots only from the CD)
+	"SC0,HDAVHDIMG,Hard disk (SCSI ID 0);",
+	"-;",
+	"F1,ROM,Load ROM;",
+	// the retail 5 MB; 13 and 21 MB (the expansion banks at 32 and 48 MB) need a 64 MB SDRAM
+	// board or larger (menu mask bit 2)
+	"H2O[7:5],Memory,5 MB;",
+	"h2O[7:5],Memory,5 MB,13 MB,21 MB;",
+	"-;",
+	"P2,Video;",
+	"P3,Input;",
+	"P4,Audio;",
+	"P5,Advanced;",
+	"-;",
+	"h0-,Changes pending;",
+	"R[0],Apply and reset;",
+
+	"P2O[32:30],Video out,NTSC,VGA,PAL;",
+	// NTSC and PAL are interlaced: Progressive shows every line each field (no flicker),
+	// Original the fields as the console sends them
+	"P2O[36],Interlace,Progressive,Original;",
+	"P2O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+	"P2O[10:9],Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
+
+	// the ADB game controller (taken at the reset: the machine only sees its bus change
+	// then, so it counts in "Changes pending"); the stick's pointer setting is hidden, its
+	// line kept, without a controller (mask bit 1)
+	"P3O[13:11],Controller,AppleJack,None,MouseStick II,Firebird,GamePad,SideWinder;",
+	"H1P3O[14],Stick moves pointer,No,Yes;",
+	// a second AppleJack from the MiSTer's second controller (with Controller AppleJack;
+	// taken at the reset, as the controller)
+	"P3O[35],Player 2 Controller,Yes,No;",
+	"h1P3-;",
+
+	"P4O[20],Use MT32-pi,Yes,No;",
+	"P4O[21],Synth,Munt,FluidSynth;",
+	// one line: the Munt ROM with Munt, the SoundFont with FluidSynth (mask bit 3)
+	"H3P4O[23:22],Munt ROM,MT-32 v1,MT-32 v2,CM-32L;",
+	"h3P4O[26:24],SoundFont,0,1,2,3,4,5,6,7;",
+	"P4O[28:27],Show Info,No,Yes,LCD-On,LCD-Auto;",
+
+	// Mac OS writes the Flash! volume back to the flash only at Shut Down or Restart;
+	// Immediately writes each change through as it is made (Pippin_flash), so the save file is
+	// written a second later
+	"P5O[37],Saves to SD,Immediately,At Shut Down;",
+	// the last disc back in the tray and the tray closed (the eject took it out); a disc
+	// chosen in the Game disc entry goes in the same way
+	"P5R[39],Insert disc;",
+	// the RTL's memory-test boot program in place of the ROM (Pippin_bootrom; its progress
+	// in the trace's DBG writes), a debug entry (2026-10-21)
+	"P5O[34],Boot,ROM,Memory test;",
+
+	// the AppleJack's buttons (Pippin_adb): 1-9 green, red, blue, yellow, the shoulders,
+	// circle, diamond, square
+	"J,Green,Red,Blue,Yellow,L Shoulder,R Shoulder,Circle,Diamond,Square;",
+	"jn,A,B,X,Y,L,R,Select,Start;",
+	"jp,B,A,Y,X,L,R,Select,Start;",
+	"I,",
+	"MT32-pi: SoundFont #0,",
+	"MT32-pi: SoundFont #1,",
+	"MT32-pi: SoundFont #2,",
+	"MT32-pi: SoundFont #3,",
+	"MT32-pi: SoundFont #4,",
+	"MT32-pi: SoundFont #5,",
+	"MT32-pi: SoundFont #6,",
+	"MT32-pi: SoundFont #7,",
+	"MT32-pi: MT-32 v1,",
+	"MT32-pi: MT-32 v2,",
+	"MT32-pi: CM-32L,",
+	"MT32-pi: Unknown mode;",
+	"v,0;",
+	"V,v",`BUILD_DATE
+};
+
+// the build date, YYMMDD in ASCII, as BCD 20YYMMDD for the debug readout
+localparam [47:0] BD = `BUILD_DATE;
+localparam [31:0] BUILD = {8'h20, BD[43:40], BD[35:32], BD[27:24], BD[19:16], BD[11:8], BD[3:0]};
+
+///////////////////////   CLOCKS   ///////////////////////////////
+
+wire clk_vid, clk_cpu, clk_mem, pll_locked;
+wire [63:0] reconfig_to_pll, reconfig_from_pll;
+pll #(.CPU_MHZ(CPU_MHZ)) pll
+(
+	.refclk(CLK_50M),
+	.rst(0),
+	.outclk_0(clk_vid),
+	.outclk_1(clk_cpu),
+	.outclk_2(clk_mem),
+	.locked(pll_locked),
+	.reconfig_to_pll,
+	.reconfig_from_pll
+);
+
+// the CPU's speed: the PLL's CPU counter (C1) rewritten through pll_cfg while the
+// machine is held in reset: of a 700 MHz VCO, 10 for 70 MHz and 7 for 100; of the
+// 800 MHz VCO of the 66 MHz build, 12 for 66.667 and 8 for 100
+wire        cfg_waitrequest;
+reg         cfg_write = 0;
+reg   [5:0] cfg_address = 0;
+reg  [31:0] cfg_data = 0;
+pll_cfg pll_cfg
+(
+	.mgmt_clk(CLK_50M),
+	.mgmt_reset(0),
+	.mgmt_waitrequest(cfg_waitrequest),
+	.mgmt_read(0),
+	.mgmt_readdata(),
+	.mgmt_write(cfg_write),
+	.mgmt_address(cfg_address),
+	.mgmt_writedata(cfg_data),
+	.reconfig_to_pll,
+	.reconfig_from_pll
+);
+
+reg  [2:0]  spd_want_s, spd_rst_s;
+reg         spd_pll = CPU_MHZ == 100;      // the speed the PLL runs (1: 100 MHz)
+reg         spd_tgt = 0;
+reg  [2:0]  spd_st = 0;
+reg  [15:0] spd_wait = 0;
+wire        spd_want;                      // the OSD's speed, under reset (below)
+wire        spd_rst;                       // the machine held in reset
+always @(posedge CLK_50M) begin
+	spd_want_s <= {spd_want_s[1:0], spd_want};
+	spd_rst_s  <= {spd_rst_s[1:0], spd_rst};
+	cfg_write  <= 0;
+	if (!cfg_waitrequest && !cfg_write) begin
+		case (spd_st)
+			3'd0: if (spd_rst_s[2] && spd_want_s[2] != spd_pll) begin
+				spd_tgt     <= spd_want_s[2];
+				cfg_address <= 6'd0;                // waitrequest mode
+				cfg_data    <= 32'd0;
+				cfg_write   <= 1;
+				spd_st      <= 3'd1;
+			end
+			3'd1: begin                          // C1: odd-divide duty for 7, high and low counts
+				cfg_address <= 6'd5;
+				cfg_data    <= (CPU_MHZ == 66) ? (spd_tgt ? {9'd0, 5'd1, 1'b0, 1'b0, 8'd4, 8'd4} : {9'd0, 5'd1, 1'b0, 1'b0, 8'd6, 8'd6})
+				                               : (spd_tgt ? {9'd0, 5'd1, 1'b1, 1'b0, 8'd4, 8'd3} : {9'd0, 5'd1, 1'b0, 1'b0, 8'd5, 8'd5});
+				cfg_write   <= 1;
+				spd_st      <= 3'd2;
+			end
+			3'd2: begin                          // start
+				cfg_address <= 6'd2;
+				cfg_data    <= 32'd0;
+				cfg_write   <= 1;
+				spd_wait    <= 16'hFFFF;
+				spd_st      <= 3'd3;
+			end
+			3'd3: if (spd_wait != 0) spd_wait <= spd_wait - 1'd1;   // 1.3 ms for the new clock to settle
+			      else begin spd_pll <= spd_tgt; spd_st <= 3'd0; end
+			default: spd_st <= 3'd0;
+		endcase
+	end
+end
+wire spd_busy = spd_st != 3'd0 || spd_want_s[2] != spd_pll;
+
+wire clk_sys = clk_mem;
+
+///////////////////////   HPS   ///////////////////////////////
+
+wire        forced_scandoubler;
+wire  [1:0] buttons;
+wire [127:0] status;
+wire        ioctl_download;
+wire [15:0] ioctl_index;
+wire [10:0] ps2_key;
+wire [24:0] ps2_mouse;
+wire [31:0] joystick_0, joystick_1;
+wire [15:0] joystick_l_analog_0, joystick_r_analog_0, joystick_l_analog_1;
+wire  [7:0] uart_mode;                // the Main's UART mode: 3 MIDI
+reg         mt32_info_req;
+reg   [3:0] mt32_info_disp;
+wire        ioctl_wr;
+wire [26:0] ioctl_addr;
+wire  [7:0] ioctl_dout;
+wire        ioctl_wait;
+wire [15:0] sdram_sz;                 // the Main's SDRAM board: [15] known, [1:0] 1 32 MB, 2 64 MB, 3 128 MB
+reg   [1:0] sdram_mod = 2'd1;         // the board the ROM went into (an unknown one taken as 32 MB)
+
+// the block devices, as the Mac SCSI family's layout has them: SCSI disks 0
+// and 1 on slots 0 and 1, the NVRAM image on 2, the Toolbox on 3, the CD-ROM
+// on 4, the CD changer on 5; then the floppy disk on 6 (the Main's generic path)
+localparam VDNUM = 7;
+wire [31:0] fd_lba;
+wire        fd_rd;
+wire  [5:0] fd_blk_cnt;
+wire [31:0] nvs_lba;
+wire        nvs_rd, nvs_wr;
+wire  [7:0] nvs_din;
+wire [31:0] sd_lba[VDNUM];
+wire  [5:0] sd_blk_cnt[VDNUM];
+wire [VDNUM-1:0] sd_rd, sd_wr, sd_ack, img_mounted;
+wire [13:0] sd_buff_addr;
+wire  [7:0] sd_buff_dout;
+wire  [7:0] sd_buff_din[VDNUM];
+wire        sd_buff_wr, img_readonly;
+wire [63:0] img_size;
+wire [31:0] disk_lba;
+wire  [7:0] disk_buff_din;
+wire  [5:0] disk_rd, disk_wr, disk_blk_cnt;
+assign sd_lba[0] = disk_lba; assign sd_lba[1] = disk_lba; assign sd_lba[2] = nvs_lba;
+assign sd_lba[3] = disk_lba; assign sd_lba[4] = disk_lba; assign sd_lba[5] = disk_lba;
+assign sd_lba[6] = fd_lba;
+assign sd_blk_cnt[0] = disk_blk_cnt; assign sd_blk_cnt[1] = disk_blk_cnt; assign sd_blk_cnt[2] = 0;
+assign sd_blk_cnt[3] = disk_blk_cnt; assign sd_blk_cnt[4] = disk_blk_cnt; assign sd_blk_cnt[5] = disk_blk_cnt;
+assign sd_blk_cnt[6] = fd_blk_cnt;
+assign sd_rd = {fd_rd, disk_rd[5:3], nvs_rd, disk_rd[1:0]};
+assign sd_wr = {1'b0, disk_wr[5:3], nvs_wr, disk_wr[1:0]};
+assign sd_buff_din[0] = disk_buff_din; assign sd_buff_din[1] = disk_buff_din; assign sd_buff_din[2] = nvs_din;
+assign sd_buff_din[3] = disk_buff_din; assign sd_buff_din[4] = disk_buff_din; assign sd_buff_din[5] = disk_buff_din;
+assign sd_buff_din[6] = 8'd0;
+
+wire pending, no_stick;                     // the OSD's menu mask bits 0 and 1 (below)
+
+hps_io #(.CONF_STR(CONF_STR), .VDNUM(VDNUM), .BLKSZ(2)) hps_io
+(
+	.clk_sys(clk_sys),
+	.HPS_BUS(HPS_BUS),
+	.EXT_BUS(),
+	.gamma_bus(),
+
+	.forced_scandoubler(forced_scandoubler),
+	.buttons(buttons),
+	.status(status),
+	.status_menumask({12'd0, status[21], sdram_mod[1], no_stick, pending}),
+	.sdram_sz(sdram_sz),
+	.ps2_key(ps2_key),
+	.ps2_mouse(ps2_mouse),
+	.joystick_0(joystick_0),
+	.joystick_1(joystick_1),
+	.joystick_l_analog_0(joystick_l_analog_0),
+	.joystick_r_analog_0(joystick_r_analog_0),
+	.joystick_l_analog_1(joystick_l_analog_1),
+	.uart_mode(uart_mode),
+	.info_req(mt32_info_req),
+	.info({4'd0, mt32_info_disp}),
+
+	.img_mounted(img_mounted),
+	.img_readonly(img_readonly),
+	.img_size(img_size),
+	.sd_lba(sd_lba),
+	.sd_blk_cnt(sd_blk_cnt),
+	.sd_rd(sd_rd),
+	.sd_wr(sd_wr),
+	.sd_ack(sd_ack),
+	.sd_buff_addr(sd_buff_addr),
+	.sd_buff_dout(sd_buff_dout),
+	.sd_buff_din(sd_buff_din),
+	.sd_buff_wr(sd_buff_wr),
+
+	.ioctl_download(ioctl_download),
+	.ioctl_index(ioctl_index),
+	.ioctl_wr(ioctl_wr),
+	.ioctl_addr(ioctl_addr),
+	.ioctl_dout(ioctl_dout),
+	.ioctl_wait(ioctl_wait),
+
+	.TIMESTAMP(timestamp)
+);
+
+// the date and time for Cuda's clock: the HPS's Unix seconds, from 1904 as a
+// Mac counts them (as the Quadra 800 core's RTC takes them), counted on here
+// (the HPS sends them at the core's start: a restart wants the time it is then);
+// 0 until the HPS has sent them
+wire [32:0] timestamp;
+reg  [31:0] mac_secs_m = 0;
+reg  [26:0] sec_div = 0;                    // clk_mem's 100 MHz
+reg         ts_tog = 0;
+always @(posedge clk_mem) begin
+	sec_div <= (sec_div == 27'd99_999_999) ? 27'd0 : sec_div + 27'd1;
+	if (sec_div == 27'd99_999_999 && mac_secs_m != 32'd0) mac_secs_m <= mac_secs_m + 32'd1;
+	ts_tog <= timestamp[32];
+	if (ts_tog != timestamp[32] && timestamp[31:0] != 32'd0) begin
+		mac_secs_m <= timestamp[31:0] + 32'd2082844800;
+		sec_div    <= 27'd0;
+	end
+end
+
+///////////////////////   OPTIONS AND RESET (memory clock)   ///////////////////////////////
+
+// the OSD's RAM size, taken at the next reset (ram_mb): by default 28 MB, which every
+// board holds (the user's choice, 2026-10-15); a size the board cannot hold beside the
+// ROM (a setting from a larger board) is the board's largest
+reg  [7:0] ram_opt;
+always @(posedge clk_mem) ram_opt <= (!sdram_mod[1] || status[7:5] == 3'd0) ? 8'd5 : (status[7:5] == 3'd1) ? 8'd13 : 8'd21;
+wire boot_memtest = memtest_m;              // the memory-test boot (Pippin_bootrom), Advanced > Boot (status[34])
+
+// the ROM upload: index 1 from the OSD, index 0 a boot.rom loaded at start; into the
+// board's top 4 MB, the board as the Main reports it when the upload starts (it does
+// so as the core starts, before the boot.rom)
+wire rom_index = ioctl_index[7:0] == 8'd0 || ioctl_index[7:0] == 8'd1;
+wire rom_wr    = ioctl_download & rom_index & ioctl_wr;
+reg  rom_loaded = 0, dl_q = 0, rom_dl = 0;
+wire [4:0] rom_at = {sdram_mod == 2'd3, sdram_mod[1], 3'b111};   // 4 MB units: 7, 15 or 31
+always @(posedge clk_mem) begin
+	dl_q <= ioctl_download;
+	if (ioctl_download & ~dl_q & rom_index) begin
+		rom_dl     <= 1;
+		rom_loaded <= 0;
+		sdram_mod  <= (sdram_sz[15] && sdram_sz[1:0] != 2'd0) ? sdram_sz[1:0] : 2'd1;
+	end
+	if (~ioctl_download & dl_q & rom_dl) begin rom_dl <= 0; rom_loaded <= 1; end
+end
+
+// Grand Central's NVRAM from this clock: a byte channel to the CPU's clock,
+// a toggle each way (the address, data and direction steady from the
+// request's toggle until the acknowledge's, the byte read steady from the
+// acknowledge's). Two users: the NVRAM image of boot1.rom (index 40), each
+// byte written with the machine in reset (the image comes before the ROM),
+// hps_io waiting meanwhile; and Pippin_nvsave, the image on block slot 2.
+// (the channel serves the save flash: Grand Central's NVRAM is not kept, and boot1.rom, MacPPC7300's
+// NVRAM download, is not taken)
+wire nv_index = 1'b0;
+wire nv_dl    = 1'b0;
+reg  [17:0] nv_m_addr;                // [17]: the NVRAM, else the flash
+reg  [7:0]  nv_m_data;
+reg         nv_m_we;
+reg         nv_req = 0, nv_busy = 0;
+reg  [2:0]  nv_ack_s;
+wire        nv_ack;                   // the CPU's side, toggled when a byte is done
+wire [7:0]  nv_c_q;                   // ... the byte read
+reg         nv_dl_pend = 0;           // an ioctl byte waiting for the channel
+reg  [17:0] nv_dl_addr;
+reg  [7:0]  nv_dl_data;
+reg         nvs_own = 0, nvs_taken = 0, nvs_done = 0;
+reg  [7:0]  nvs_q;
+wire        nvs_req, nvs_we;
+wire [17:0] nvs_addr;
+wire [7:0]  nvs_wdata;
+always @(posedge clk_mem) begin
+	nv_ack_s <= {nv_ack_s[1:0], nv_ack};
+	nvs_done <= 0;
+	if (!nvs_req) nvs_taken <= 0;
+	if (!nv_busy) begin
+		if (nv_dl_pend) begin
+			nv_m_addr  <= nv_dl_addr;
+			nv_m_data  <= nv_dl_data;
+			nv_m_we    <= 1;
+			nv_req     <= ~nv_req;
+			nv_busy    <= 1;
+			nvs_own    <= 0;
+			nv_dl_pend <= 0;
+		end
+		else if (nvs_req & ~nvs_taken) begin
+			nv_m_addr  <= nvs_addr;
+			nv_m_data  <= nvs_wdata;
+			nv_m_we    <= nvs_we;
+			nv_req     <= ~nv_req;
+			nv_busy    <= 1;
+			nvs_own    <= 1;
+			nvs_taken  <= 1;
+		end
+	end
+	else if (nv_ack_s[2] == nv_req) begin
+		nv_busy <= 0;
+		if (nvs_own) begin
+			nvs_done <= 1;
+			nvs_q    <= nv_c_q;
+		end
+	end
+	// (after the issue: a byte arriving in the clock a pending one is issued stays pending)
+	if (nv_dl & ioctl_wr & ioctl_addr[26:13] == 14'd0) begin
+		nv_dl_pend <= 1;
+		nv_dl_addr <= {5'd0, ioctl_addr[12:0]};
+		nv_dl_data <= ioctl_dout;
+	end
+end
+wire sd_up_busy;
+assign ioctl_wait = sd_up_busy | nv_busy | nv_dl_pend;
+
+// the NVRAM image on block slot 2 (milestone P)
+reg         nv_dirty_t = 0;           // toggled in the CPU's clock at each CPU write to the flash
+reg         gc_dirty_t = 0;           // ... and to Grand Central's NVRAM
+wire        nvs_hold;
+Pippin_nvsave #(.CLK_HZ(100_000_000), .ABITS(17), .BBITS(13)) nvsave (
+	.clk(clk_mem), .reset(~pll_locked),
+	.img_mounted(img_mounted[2]), .img_size, .img_readonly,
+	.sd_lba(nvs_lba), .sd_rd(nvs_rd), .sd_wr(nvs_wr), .sd_ack(sd_ack[2]),
+	.sd_buff_addr, .sd_buff_dout, .sd_buff_wr(sd_buff_wr & sd_ack[2]), .sd_buff_din(nvs_din),
+	.osd_open(OSD_STATUS), .dirty_tog_a(nv_dirty_t), .dirty_tog_b(gc_dirty_t), .hold(nvs_hold),
+	.b_req(nvs_req), .b_we(nvs_we), .b_addr(nvs_addr), .b_wdata(nvs_wdata),
+	.b_done(nvs_done), .b_rdata(nvs_q)
+);
+
+reg  [1:0] locked_m = 0;
+always @(posedge clk_mem) locked_m <= {locked_m[0], pll_locked};
+wire sdram_init = ~locked_m[1];
+wire sdram_ready;
+
+// after a Shut Down the machine is off (Cuda's power-down) until a reset or the power key
+wire       power_wake;
+reg  [1:0] wake_m;
+always @(posedge clk_mem) wake_m <= {wake_m[0], power_wake};
+reg  [2:0] reset_in;
+always @(posedge clk_mem) reset_in <= {reset_in[1:0], RESET | status[0] | buttons[1] | wake_m[1]};
+
+// the monitor's AppleSense codes (dingusppc's displayid.cpp): the 16-inch RGB
+// (7, 2D), the 13-inch (6, 2B), the 12-inch (2, 21), the 17-inch Multiple Scan
+// (6, 0B: 640 x 480 to 1024 x 768, chosen in the Monitors control panel), the
+// 21-inch RGB (0, 00: 1152 x 870, a 100 MHz dot clock) or the 20-inch Multiple
+// Scan (6, 23: 640 x 480 to 1152 x 870; Mac OS 7.6.1 lists 1280 x 960 and 1280 x
+// 1024 too but stays in the mode it had)
+// the console's video switch: NTSC (5, the default), VGA (6), PAL (3)
+wire [2:0] mon_sel = (status[32:30] == 3'd1) ? 3'd6 : (status[32:30] == 3'd2) ? 3'd3 : 3'd5;
+
+// the OSD's controller list: AppleJack first (controller 5), then none and the others (0-4)
+wire [2:0] joy_sel = (status[13:11] == 3'd0) ? 3'd5 : (status[13:11] > 3'd5) ? 3'd0 : status[13:11] - 3'd1;
+
+reg       spd_want_m = 0;
+reg [2:0] spd_busy_s = 3'b111, spd_pll_s;
+always @(posedge clk_mem) begin
+	spd_busy_s <= {spd_busy_s[1:0], spd_busy};
+	spd_pll_s  <= {spd_pll_s[1:0], spd_pll};
+end
+assign spd_want = spd_want_m;
+
+reg cpu_reset_m = 1;
+always @(posedge clk_mem)
+	cpu_reset_m <= reset_in[2] | ~sdram_ready | rom_dl | nv_dl | nvs_hold | (~boot_memtest & ~rom_loaded) | spd_busy_s[2];
+assign spd_rst = cpu_reset_m;
+
+// the options a running Mac cannot follow, taken under reset (a change waits for the next):
+// the RAM size, the monitor, the ADB game controller, the Ethernet bridge, the CPU's speed
+// (the PLL's, once it runs it); Pippin_adb synchronises the controller's bus
+reg  [7:0]  ram_mb = 8'd5;
+reg  [2:0]  mon_m = 3'd5;                   // NTSC
+reg  [2:0]  joy_mode = 0;
+reg         aj2_m = 0;                      // the second AppleJack (status[35] 0: yes)
+reg         net_on = 0;
+reg         tr_mesh_m = 0;                  // the trace also takes MESH (status[29]: no menu entry)
+reg         l2_on_m = 1;
+reg         cpu_fast_m = 0;
+reg         memtest_m = 0;                  // Advanced > Boot: the memory test in place of the ROM
+always @(posedge clk_mem) if (cpu_reset_m) begin
+	ram_mb     <= ram_opt;
+	mon_m      <= mon_sel;
+	joy_mode   <= joy_sel;
+	aj2_m      <= ~status[35];
+	net_on     <= 1'b0;                     // no Ethernet on the Pippin
+	tr_mesh_m  <= status[29];
+	l2_on_m    <= ~status[4];
+	memtest_m  <= status[34];
+	spd_want_m <= 1'b0;                     // the PLL's 70 MHz, never reconfigured
+	cpu_fast_m <= spd_pll_s[2];
+end
+// the OSD's Eject disc: the console's eject button held 400 ms (the ROM debounces it over ~6
+// ticks, 100 ms), in the CPU's clock
+localparam int unsigned EJ_CLKS = CPU_HZ / 10 * 4;
+reg  [1:0]  ej_s = 2'b00;
+reg         ej_q = 1'b0, eject_btn = 1'b0;
+reg  [31:0] ej_cnt = 32'd0;
+always @(posedge clk_cpu) begin
+	ej_s <= {ej_s[0], status[38]};
+	ej_q <= ej_s[1];
+	if (ej_s[1] && !ej_q) ej_cnt <= EJ_CLKS;
+	else if (ej_cnt != 32'd0) ej_cnt <= ej_cnt - 32'd1;
+	eject_btn <= ej_cnt != 32'd0;
+end
+// the OSD's Insert disc: one clock in the CPU's clock
+reg  [1:0]  ins_s = 2'b00;
+reg         ins_q = 1'b0, cd_insert = 1'b0;
+always @(posedge clk_cpu) begin
+	ins_s     <= {ins_s[0], status[39]};
+	ins_q     <= ins_s[1];
+	cd_insert <= ins_s[1] && !ins_q;
+end
+
+// "Changes pending" (menu mask bit 0): an OSD setting differs from the one the machine
+// took at its last reset (the memory, the video out, the controller); the Input page's
+// stick setting and the media apply at once and are left out
+assign pending  = ram_opt != ram_mb || mon_sel != mon_m || joy_sel != joy_mode || status[34] != memtest_m ||
+                  ~status[35] != aj2_m;
+// mask bit 1: no controller, so no stick to move the pointer with
+assign no_stick = joy_sel == 3'd0;
+
+wire [51:0] joy = {status[14], joy_mode, joystick_r_analog_0, joystick_l_analog_0, joystick_0[15:0]};
+wire [32:0] joy2 = {aj2_m, joystick_l_analog_1, joystick_1[15:0]};
+
+// into the CPU's clock (the options are quasi-static: they change only with the reset held)
+reg [2:0] cpu_reset_s = 3'b111;
+reg [7:0] ram_mb_c [2];
+reg [4:0] rom_at_c [2];
+reg [1:0] boot_memtest_c;
+reg [2:0] mon_c [2];
+reg [1:0] tr_mesh_c;
+reg [1:0] l2_on_c = 2'b11;
+reg [1:0] cpu_fast_c;
+always @(posedge clk_cpu) begin
+	cpu_reset_s    <= {cpu_reset_s[1:0], cpu_reset_m};
+	cpu_fast_c     <= {cpu_fast_c[0], cpu_fast_m};
+	ram_mb_c[0]    <= ram_mb;
+	ram_mb_c[1]    <= ram_mb_c[0];
+	rom_at_c[0]    <= rom_at;
+	rom_at_c[1]    <= rom_at_c[0];
+	boot_memtest_c <= {boot_memtest_c[0], boot_memtest};
+	mon_c[0]       <= mon_m;
+	mon_c[1]       <= mon_c[0];
+	tr_mesh_c      <= {tr_mesh_c[0], tr_mesh_m};
+	l2_on_c        <= {l2_on_c[0], l2_on_m};
+end
+wire cpu_reset = cpu_reset_s[2];
+
+// the clock's seconds, quasi-static: taken once seen the same twice
+reg [31:0] mac_secs_s [2];
+reg [31:0] clock_secs = 0;
+always @(posedge clk_cpu) begin
+	mac_secs_s[0] <= mac_secs_m;
+	mac_secs_s[1] <= mac_secs_s[0];
+	if (mac_secs_s[1] == mac_secs_s[0]) clock_secs <= mac_secs_s[1];
+end
+wire clock_ok = clock_secs != 32'd0;
+
+// the NVRAM image's bytes, in the CPU's clock (address and data are stable
+// from the toggle until the acknowledge returns)
+reg  [2:0]  nv_req_s;
+reg         nv_ack_c = 0, nv_ld_we = 0, nv_ld_re = 0;
+reg  [17:0] nv_ld_addr;                    // [17]: Grand Central's NVRAM, else the flash
+reg  [7:0]  nv_ld_data, nv_q_c;
+reg         nv_ld_rack = 0;                // the flash's byte is there the clock after its read
+wire        nv_wr_cpu;                     // the CPU programmed or erased the flash
+wire [7:0]  nv_ld_q;
+wire        gc_ld_rack;                    // the NVRAM's read done (Pippin_gc), its byte
+wire [7:0]  gc_ld_q;
+wire        gc_wr_cpu;                     // the CPU wrote the NVRAM
+wire        nv_rd_done = nv_ld_addr[17] ? gc_ld_rack : nv_ld_rack;
+always @(posedge clk_cpu) begin
+	nv_req_s <= {nv_req_s[1:0], nv_req};
+	nv_ld_we <= 0;
+	nv_ld_rack <= nv_ld_re & ~nv_ld_rack;
+	if (nv_ld_re & nv_rd_done) begin           // a read done: the byte, then the acknowledge
+		nv_ld_re <= 0;
+		nv_q_c   <= nv_ld_addr[17] ? gc_ld_q : nv_ld_q;
+		nv_ack_c <= nv_req_s[2];
+	end
+	else if (~nv_ld_re & (nv_req_s[2] != nv_ack_c)) begin
+		nv_ld_addr <= nv_m_addr;
+		if (nv_m_we) begin
+			nv_ld_data <= nv_m_data;
+			nv_ld_we   <= 1;
+			nv_ack_c   <= nv_req_s[2];
+		end
+		else nv_ld_re <= 1;
+	end
+	if (nv_wr_cpu) nv_dirty_t <= ~nv_dirty_t;
+	if (gc_wr_cpu) gc_dirty_t <= ~gc_dirty_t;
+end
+assign nv_ack = nv_ack_c;
+assign nv_c_q = nv_q_c;
+
+// the UART: the modem port (Open Firmware's console when it is told so); it
+// also drives the MT32-pi's MIDI in, and in the Main's MIDI mode the user
+// port's MIDI joins what it receives (both lines idle high)
+wire modem_txd;
+wire mt32_midi_rx;
+wire midi_in   = (uart_mode == 8'd3) ? mt32_midi_rx : 1'b1;
+wire modem_rxd = UART_RXD & midi_in;
+assign UART_TXD = modem_txd;
+// the handshake, as the Quadra 800 core's (an ImageWriter through the Main's
+// printer daemon, PPP): CTS uninverted, RTS while a received byte waits, the
+// other end's DTR back as its DSR
+wire modem_rts;
+wire modem_cts = UART_CTS;
+assign UART_RTS = modem_rts;
+assign UART_DTR = UART_DSR;
+
+// the MT32-pi on the user port (sys/mt32pi.sv), as the Quadra 800 core has it; it
+// takes the modem port only while the port runs at MIDI's rate (a console at
+// 38,400 baud, Linux's, hung it)
+wire        modem_midi;
+wire [15:0] mt32_i2s_l, mt32_i2s_r;
+wire        mt32_available;
+wire        mt32_mute = mt32_available & status[20];
+wire        mt32_use  = mt32_available & ~status[20];
+wire  [1:0] mt32_info = status[28:27];
+wire  [7:0] mt32_mode, mt32_rom, mt32_sf;
+wire        mt32_newmode, mt32_lcd_en, mt32_lcd_pix, mt32_lcd_update;
+
+mt32pi mt32pi
+(
+	.CLK_AUDIO(CLK_AUDIO),
+	.CLK_VIDEO(clk_mem),
+	.CE_PIXEL(CE_PIXEL),
+	.VGA_VS(VGA_VS),
+	.VGA_DE(VGA_DE),
+	.USER_IN(USER_IN),
+	.USER_OUT(USER_OUT),
+	.reset(cpu_reset_m),
+	.midi_tx(modem_txd | mt32_mute | ~modem_midi),
+	.midi_rx(mt32_midi_rx),
+	.mt32_i2s_r(mt32_i2s_r),
+	.mt32_i2s_l(mt32_i2s_l),
+	.mt32_available(mt32_available),
+	.mt32_mode_req(status[21]),
+	.mt32_rom_req(status[23:22]),
+	.mt32_sf_req({5'd0, status[26:24]}),
+	.mt32_mode(mt32_mode),
+	.mt32_rom(mt32_rom),
+	.mt32_sf(mt32_sf),
+	.mt32_newmode(mt32_newmode),
+	.mt32_lcd_en(mt32_lcd_en),
+	.mt32_lcd_pix(mt32_lcd_pix),
+	.mt32_lcd_update(mt32_lcd_update)
+);
+
+// Show Info: Yes pops the mode up (the I, strings) when the Pi changes it
+reg mt32_newmode_q;
+always @(posedge clk_mem) begin
+	mt32_newmode_q <= mt32_newmode;
+	mt32_info_req <= (mt32_newmode_q ^ mt32_newmode) && (mt32_info == 2'd1);
+	mt32_info_disp <= (mt32_mode == 8'hA2) ? (4'd1 + mt32_sf[2:0]) :
+	                  (mt32_mode == 8'hA1 && mt32_rom == 8'd0) ? 4'd9 :
+	                  (mt32_mode == 8'hA1 && mt32_rom == 8'd1) ? 4'd10 :
+	                  (mt32_mode == 8'hA1 && mt32_rom == 8'd2) ? 4'd11 : 4'd12;
+end
+
+// the Pi's LCD over the picture: LCD-On always, LCD-Auto for 2 s after it changes
+reg        mt32_lcd_on;
+reg [27:0] mt32_lcd_to;
+reg        mt32_lcd_q;
+always @(posedge clk_mem) begin
+	mt32_lcd_q <= mt32_lcd_update;
+	if (mt32_lcd_to != 0) mt32_lcd_to <= mt32_lcd_to - 1'd1;
+	if (mt32_info == 2'd2) mt32_lcd_on <= 1;
+	else if (mt32_info != 2'd3) mt32_lcd_on <= 0;
+	else begin
+		if (mt32_lcd_to == 0) mt32_lcd_on <= 0;
+		if (mt32_lcd_q ^ mt32_lcd_update) begin
+			mt32_lcd_on <= 1;
+			mt32_lcd_to <= 28'd200_000_000;
+		end
+	end
+end
+
+// AWACS, the CD and the Pi's synthesiser, saturated
+wire signed [17:0] mix_cl = $signed({{2{snd_left[15]}}, snd_left}) + $signed({{2{cd_left[15]}}, cd_left});
+wire signed [17:0] mix_cr = $signed({{2{snd_right[15]}}, snd_right}) + $signed({{2{cd_right[15]}}, cd_right});
+wire signed [17:0] mix_l  = mix_cl + $signed(mt32_use ? {{2{mt32_i2s_l[15]}}, mt32_i2s_l} : 18'd0);
+wire signed [17:0] mix_r  = mix_cr + $signed(mt32_use ? {{2{mt32_i2s_r[15]}}, mt32_i2s_r} : 18'd0);
+assign AUDIO_L = (mix_l > 18'sd32767) ? 16'h7FFF : (mix_l < -18'sd32768) ? 16'h8000 : mix_l[15:0];
+assign AUDIO_R = (mix_r > 18'sd32767) ? 16'h7FFF : (mix_r < -18'sd32768) ? 16'h8000 : mix_r[15:0];
+
+///////////////////////   THE MACHINE   ///////////////////////////////
+
+wire         b_req, b_we, b_line, b_ack;
+wire [31:2]  b_addr;
+wire  [3:0]  b_be;
+wire [255:0] b_wdata, b_rdata;
+
+wire         cpu_req, cpu_we, cpu_line, cpu_ack, cpu_irq, cpu_tb_tick;
+wire         cpu_held;          // the CPU in reset: cpu_reset, or Cuda holding it
+wire [31:2]  cpu_addr;
+wire  [3:0]  cpu_be;
+wire [255:0] cpu_wdata, cpu_rdata;
+wire  [31:0] dbg_status, dbg_passes, dbg_errors, dbg_first;
+wire         trace_valid, trace_last, trace_reg_we, trace_dreq, trace_dwe;
+wire  [31:0] trace_pc, trace_insn, trace_cr, trace_xer, trace_lr, trace_ctr, trace_fpscr, trace_msr, trace_dwdata;
+wire   [6:0] trace_reg_idx;
+wire  [63:0] trace_reg_val;
+wire   [2:0] trace_dkind;
+wire  [31:2] trace_daddr;
+wire   [3:0] trace_dbe;
+wire         mac_ce, mac_hs, mac_vs, mac_hblank, mac_vblank, vid_field;
+wire   [7:0] mac_r, mac_g, mac_b;
+
+assign DDRAM_CLK = clk_mem;
+
+Pippin_system #(.CPU_HZ(CPU_HZ), .CPU_HZ_FAST(100000000), .L2_KB(L2_KB), .TB_HZ(16500000),
+                    .TRACE(TRACE), .SOUND_IN_DMA(SOUND_IN_DMA), .PERF(PERF), .SND_TRACE(SND_TRACE),
+                    .CAPTURE(CAPTURE), .DENSE(DENSE), .TRACE_RAM(TRACE_RAM), .TRACE_FL(TRACE_FL)) system
+(
+	.clk(clk_cpu),
+	.cpu_fast(cpu_fast_c[1]),
+	.reset(cpu_reset),
+	.cpu_in_reset(cpu_held),
+	.power_wake,
+	.reset_pc(32'hFFF00100),
+	.ram_mb(ram_mb_c[1]),
+	.rom_at(rom_at_c[1]),
+	.boot_memtest(boot_memtest_c[1]),
+	.l2_on(l2_on_c[1]),
+
+	.clk_b(clk_mem),
+	.reset_b(cpu_reset_m),
+	.b_req, .b_we, .b_line, .b_addr, .b_be, .b_wdata, .b_ack, .b_rdata,
+
+	.cpu_req, .cpu_we, .cpu_line, .cpu_addr, .cpu_be, .cpu_wdata, .cpu_ack, .cpu_rdata, .cpu_irq, .cpu_tb_tick,
+	.modem_txd, .modem_rxd, .modem_cts, .modem_rts, .modem_midi, .snd_left, .snd_right,
+	.nv_ld_we(nv_ld_we & nv_ld_addr[17]), .nv_ld_re(nv_ld_re & nv_ld_addr[17]), .nv_ld_addr(nv_ld_addr[12:0]),
+	.nv_ld_data(nv_ld_data), .nv_ld_rack(gc_ld_rack), .nv_ld_q(gc_ld_q), .nv_wr_cpu(gc_wr_cpu),
+	.mon_id(mon_c[1]), .vid_progressive(~status[36]), .eject_btn(eject_btn), .cd_insert(cd_insert),
+	.fl_ld_we(nv_ld_we & ~nv_ld_addr[17]), .fl_ld_re(nv_ld_re & ~nv_ld_addr[17]), .fl_ld_addr(nv_ld_addr[16:0]),
+	.fl_ld_data(nv_ld_data), .fl_ld_q(nv_ld_q),
+	.fl_changed(nv_wr_cpu), .fl_instant(~status[37]),
+	.ps2_key, .ps2_mouse, .joy, .joy2,           // in the memory clock: Pippin_adb synchronises them
+	.clock_ok, .clock_secs,
+	.img_mounted(img_mounted[5:0]), .img_size, .img_readonly,   // the targets' side runs in the memory clock
+	.sd_lba(disk_lba), .sd_rd(disk_rd), .sd_wr(disk_wr), .sd_blk_cnt(disk_blk_cnt), .sd_ack(sd_ack[5:0]),
+	.fd_mounted(img_mounted[6]), .fd_lba, .fd_rd, .fd_blk_cnt, .fd_ack(sd_ack[6]),
+	.sd_buff_addr, .sd_buff_dout, .sd_buff_din(disk_buff_din), .sd_buff_wr, .disk_busy,
+	.cd_left, .cd_right,
+	.net_on, .tr_mesh(tr_mesh_c[1]),
+	.ddr_busy(DDRAM_BUSY), .ddr_burstcnt(DDRAM_BURSTCNT), .ddr_addr(DDRAM_ADDR), .ddr_dout(DDRAM_DOUT),
+	.ddr_dout_ready(DDRAM_DOUT_READY), .ddr_rd(DDRAM_RD), .ddr_din(DDRAM_DIN), .ddr_be(DDRAM_BE), .ddr_we(DDRAM_WE),
+	.vid_ce(mac_ce), .vid_r(mac_r), .vid_g(mac_g), .vid_b(mac_b), .vid_hs(mac_hs), .vid_vs(mac_vs),
+	.vid_hblank(mac_hblank), .vid_vblank(mac_vblank), .vid_field, .vid_interlaced(),
+	.dbg_status, .dbg_passes, .dbg_errors, .dbg_first,
+	.trace_valid, .trace_last, .trace_pc, .trace_insn, .trace_reg_we, .trace_reg_idx, .trace_reg_val,
+	.trace_cr, .trace_xer, .trace_lr, .trace_ctr, .trace_fpscr, .trace_msr,
+	.trace_dreq, .trace_dwe, .trace_dkind, .trace_daddr, .trace_dbe, .trace_dwdata,
+	.perf_cnt()
+);
+
+///////////////////////   SDRAM   ///////////////////////////////
+
+wire [15:0] sd_dq_out;
+wire        sd_dq_oe;
+assign SDRAM_DQ = sd_dq_oe ? sd_dq_out : 16'hZZZZ;
+
+Pippin_sdram #(.CLK_MHZ(100), .DIAG(TRACE_RAM != 0)) sdram
+(
+	.clk(clk_mem),
+	.init(sdram_init),
+	.ready(sdram_ready),
+
+	.req(b_req), .we(b_we), .line(b_line), .addr(b_addr[26:2]), .be(b_be), .wdata(b_wdata),
+	.ack(b_ack), .rdata(b_rdata),
+
+	.up_wr(rom_wr),
+	.up_addr({rom_at, ioctl_addr[21:0]}),    // the board's top 4 MB
+	.up_data(ioctl_dout),
+	.up_busy(sd_up_busy),
+
+	.SDRAM_A, .SDRAM_BA, .SDRAM_nCS, .SDRAM_nRAS, .SDRAM_nCAS, .SDRAM_nWE,
+	.SDRAM_DQML, .SDRAM_DQMH, .SDRAM_CKE,
+	.dq_out(sd_dq_out), .dq_oe(sd_dq_oe), .dq_in(SDRAM_DQ)
+);
+
+// SDRAM_CLK is the memory clock inverted, from a DDR output register, as in
+// Sorgelig's sdram.sv
+altddio_out
+#(
+	.extend_oe_disable("OFF"),
+	.intended_device_family("Cyclone V"),
+	.invert_output("OFF"),
+	.lpm_hint("UNUSED"),
+	.lpm_type("altddio_out"),
+	.oe_reg("UNREGISTERED"),
+	.power_up_high("OFF"),
+	.width(1)
+)
+sdramclk_ddr
+(
+	.datain_h(1'b0),
+	.datain_l(1'b1),
+	.outclock(clk_mem),
+	.dataout(SDRAM_CLK),
+	.aclr(1'b0),
+	.aset(1'b0),
+	.oe(1'b1),
+	.outclocken(1'b1),
+	.sclr(1'b0),
+	.sset(1'b0)
+);
+
+///////////////////////   THE LED   ///////////////////////////////
+
+// The user LED follows the disk LED (a block moving to or from the CD or the save flash's image);
+// otherwise it stays dark. (MacPPC7300's showed the CPU's heartbeat, bit 20 of the instructions
+// retired: a flicker at about 35 Hz.)
+wire led_user = disk_led_s[1];
+
+///////////////////////   THE PICTURE   ///////////////////////////////
+
+// Control's scan-out, in the memory clock
+assign CLK_VIDEO = clk_mem;
+assign CE_PIXEL  = mac_ce;
+wire   pic_de    = ~(mac_hblank | mac_vblank);
+assign VGA_HS    = mac_hs;
+
+// Aspect ratio and integer scaling are the framework's, as in the other Mac
+// cores: video_freak turns the OSD's Scale choice into the VIDEO_ARX/ARY
+// form the scaler takes (V-Integer: every Mac line the same whole number of
+// output lines; 640 x 480 becomes 960 lines on a 1080-line output, where
+// Normal's 2.25 makes uneven lines). No crop.
+video_freak video_freak
+(
+	.CLK_VIDEO(clk_mem),
+	.CE_PIXEL(CE_PIXEL),
+	.VGA_VS(VGA_VS),
+	.HDMI_WIDTH(HDMI_WIDTH),
+	.HDMI_HEIGHT(HDMI_HEIGHT),
+	.VGA_DE(VGA_DE),
+	.VIDEO_ARX(VIDEO_ARX),
+	.VIDEO_ARY(VIDEO_ARY),
+	.VGA_DE_IN(pic_de),
+	.ARX((!ar) ? 12'd4 : (ar - 1'd1)),
+	.ARY((!ar) ? 12'd3 : 12'd0),
+	.CROP_SIZE(12'd0),
+	.CROP_OFF(5'd0),
+	.SCALE({1'b0, status[10:9]})
+);
+assign VGA_VS    = mac_vs;
+// the MT32-pi's LCD: the picture dimmed in its box, the text pixel on top
+wire       mt32_lcd = mt32_lcd_en & mt32_lcd_on;
+wire [7:0] pic_r    = mac_r;
+wire [7:0] pic_g    = mac_g;
+wire [7:0] pic_b    = mac_b;
+assign VGA_R     = mt32_lcd ? {{2{mt32_lcd_pix}}, pic_r[7:2]} : pic_r;
+assign VGA_G     = mt32_lcd ? {{2{mt32_lcd_pix}}, pic_g[7:2]} : pic_g;
+assign VGA_B     = mt32_lcd ? {{2{mt32_lcd_pix}}, pic_b[7:2]} : pic_b;
+
+assign LED_USER  = led_user;
+
+endmodule

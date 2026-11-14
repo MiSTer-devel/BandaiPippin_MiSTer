@@ -1,0 +1,216 @@
+//============================================================================
+//
+//  DSPPC603 - PowerPC 603-class CPU core
+//  Integer ALU (combinational)
+//
+//  Adder, compare, logic, count leading zeros, sign extension, and one
+//  rotator with a mask generator that serves every rotate and shift.
+//
+//============================================================================
+
+module DSPPC603_alu
+(
+	input  DSPPC603_pkg::int_ctl_t ctl,
+	input  logic [31:0] a,
+	input  logic [31:0] b,
+	input  logic        ca_in,
+
+	output logic [31:0] result,
+	output logic [31:0] sum,         // the adder's sum on its own: the effective address of a memory access
+	output logic        ca_out,
+	output logic        ov_out,
+	output logic        lt,          // compare results, A against B, signed or not as ctl says
+	output logic        gt,
+	output logic        eq,
+	output logic        lt_s,        // ... and both at once, for the trap instructions
+	output logic        lt_u,
+	output logic        zero,        // the result is zero (found per operation, before the result's choice)
+	output logic        neg,         // ... and its sign bit, likewise
+	output logic        rot_zero,    // the rotator's result is zero, found without the rotator for the
+	                                 // shifts (a under a mask of the count: the 66 MHz work, 2026-10-24)
+	output logic [31:0] log_o,       // each operation's own result, for a flat choice outside (sum is the adder's)
+	output logic [31:0] rot_o,
+	input  logic [31:0] mask_imm,    // the immediate forms' mask and the mask rotated by the count, registered
+	input  logic [31:0] mask_rot_imm, // with the operation by the pipeline (from the instruction's bits in ID)
+	output logic        rot_imm_zero, // the rotator's result's zero and sign with the immediate count (SH),
+	output logic        rot_imm_neg,  // whatever ctl.sh_reg says, the mask rotated by the count instead of
+	                                 // the operand: CR0 of an immediate-count form from these, so that no
+	                                 // forwarded operand goes through a rotator to CR0 (the 66 MHz work,
+	                                 // 2026-10-24; a register-count record form takes a second cycle)
+	output logic [31:0] clz_o,
+	output logic [31:0] exts_o
+);
+
+import DSPPC603_pkg::*;
+
+// ---- adder -----------------------------------------------------------------
+logic [31:0] add_a;
+logic        add_ci;
+logic [32:0] add_sum;
+
+always_comb begin
+	add_a = ctl.inv_a ? ~a : a;
+	case (ctl.cin)
+		CIN_ONE: add_ci = 1'b1;
+		CIN_CA:  add_ci = ca_in;
+		default: add_ci = 1'b0;
+	endcase
+	add_sum = {1'b0, add_a} + {1'b0, b} + {32'd0, add_ci};
+end
+
+wire add_ov = (add_a[31] == b[31]) & (add_sum[31] != add_a[31]);
+
+// ---- compare ---------------------------------------------------------------
+// From the adder: a compare (and a trap) is decoded as b - a, so the carry
+// out and the true sign of the sum say how A and B stand, signed and
+// unsigned at once, without comparators of their own.
+always_comb begin
+	eq   = (a == b);
+	lt_u = add_sum[32] & ~eq;                 // b - a has no borrow and is not zero
+	lt_s = ~(add_sum[31] ^ add_ov) & ~eq;     // b - a is positive, overflow allowed for
+	lt   = ctl.is_signed ? lt_s : lt_u;
+	gt   = ~lt & ~eq;
+end
+
+// ---- logic -----------------------------------------------------------------
+logic [31:0] log_b;
+logic [31:0] log_raw;
+logic [31:0] log_res;
+
+always_comb begin
+	log_b = ctl.log_inv_b ? ~b : b;
+	case (ctl.log_op)
+		LOG_OR:  log_raw = a | log_b;
+		LOG_XOR: log_raw = a ^ log_b;
+		default: log_raw = a & log_b;
+	endcase
+	log_res = ctl.log_inv_out ? ~log_raw : log_raw;
+end
+
+// ---- rotate and mask -------------------------------------------------------
+// mask(mb, me): ones from bit mb through bit me in PowerPC numbering (bit 0 is
+// the most significant), wrapping around when mb > me.
+function automatic logic [31:0] mask_gen(input logic [4:0] mb, input logic [4:0] me);
+	logic [31:0] m1;
+	logic [31:0] m2;
+	begin
+		m1 = 32'hFFFFFFFF >> mb;
+		m2 = 32'hFFFFFFFF << (5'd31 - me);
+		mask_gen = (mb <= me) ? (m1 & m2) : (m1 | m2);
+	end
+endfunction
+
+logic [5:0]  sh_n;       // shift count; bit 5 means "32 or more" for shifts
+logic [63:0] rotl_dbl, rotr_dbl;
+logic [31:0] rot;
+logic [31:0] mask;
+logic [31:0] rot_res;
+logic        rot_ca;
+
+always_comb begin
+	sh_n = ctl.sh_reg ? b[5:0] : {1'b0, ctl.sh};
+
+	// a rotator each way, rather than right by n as left by 32-n: the
+	// subtraction was in series with the forwarded rB and the shift
+	// (2026-10-13, at 110 MHz)
+	rotl_dbl = {a, a} << sh_n[4:0];
+	rotr_dbl = {a, a} >> sh_n[4:0];
+	case (ctl.rot_op)
+		ROT_SRW, ROT_SRAW: rot = rotr_dbl[31:0];
+		default:           rot = rotl_dbl[63:32];
+	endcase
+
+	case (ctl.rot_op)
+		ROT_SLW:           mask = sh_n[5] ? 32'd0 : mask_gen(5'd0, 5'd31 - sh_n[4:0]);
+		ROT_SRW, ROT_SRAW: mask = sh_n[5] ? 32'd0 : mask_gen(sh_n[4:0], 5'd31);
+		default:           mask = mask_gen(ctl.mb, ctl.me);
+	endcase
+
+	case (ctl.rot_op)
+		ROT_RLWIMI: rot_res = (rot & mask) | (b & ~mask);
+		ROT_SRAW:   rot_res = (rot & mask) | ({32{a[31]}} & ~mask);
+		default:    rot_res = rot & mask;
+	endcase
+
+	// sraw, srawi: carry when a negative value loses any one bits: those are
+	// a's low n bits (all of a for a count of 32 or more), found without the
+	// rotator (the 66 MHz work, 2026-10-24: the rotator was in front of XER)
+	rot_ca = a[31] & (sh_n[5] ? (|a) : (|(a & ~(32'hFFFFFFFF << sh_n[4:0]))));
+
+	// a shift's result is zero when the bits of a it keeps are all zero: a
+	// left shift keeps a's low 32-n bits, a right shift its high 32-n (and
+	// an arithmetic one fills with the sign); a rotate's needs the rotator
+	case (ctl.rot_op)
+		ROT_SLW:  rot_zero = sh_n[5] | ~(|(a & (32'hFFFFFFFF >> sh_n[4:0])));
+		ROT_SRW:  rot_zero = sh_n[5] | ~(|(a & (32'hFFFFFFFF << sh_n[4:0])));
+		ROT_SRAW: rot_zero = ~a[31] & (sh_n[5] | ~(|(a & (32'hFFFFFFFF << sh_n[4:0]))));
+		default:  rot_zero = ~(|rot_res);
+	endcase
+end
+
+// The immediate-count forms' zero and sign without rotating the operand:
+// rotl(a, n) & m == 0 exactly when a & rotr(m, n) == 0 (and rotr(a, n) & m
+// when a & rotl(m, n)); the mask and its rotation come registered from the
+// pipeline (made in ID from the instruction's own bits: a mask made here was
+// as deep as the rotator it replaced, 2026-10-24). srawi's sign fill makes a
+// negative operand's result non-zero; rlwimi adds the kept bits of b. The
+// sign is one bit of the rotation (a 32:1 choice).
+logic [63:0] a_rotl_i, a_rotr_i;
+logic        rot_i31;
+always_comb begin
+	a_rotl_i = {a, a} << ctl.sh;
+	a_rotr_i = {a, a} >> ctl.sh;
+	case (ctl.rot_op)
+		ROT_SRW, ROT_SRAW: rot_i31 = a_rotr_i[31];
+		default:           rot_i31 = a_rotl_i[63];
+	endcase
+	case (ctl.rot_op)
+		ROT_RLWIMI: begin
+			rot_imm_zero = ~(|(a & mask_rot_imm)) & ~(|(b & ~mask_imm));
+			rot_imm_neg  = mask_imm[31] ? rot_i31 : b[31];
+		end
+		ROT_SRAW: begin
+			rot_imm_zero = ~a[31] & ~(|(a & mask_rot_imm));
+			rot_imm_neg  = mask_imm[31] ? rot_i31 : a[31];
+		end
+		default: begin
+			rot_imm_zero = ~(|(a & mask_rot_imm));
+			rot_imm_neg  = mask_imm[31] & rot_i31;
+		end
+	endcase
+end
+
+// ---- count leading zeros ---------------------------------------------------
+function automatic logic [5:0] clz32(input logic [31:0] v);
+	begin
+		clz32 = 6'd32;
+		for (int i = 0; i < 32; i++)
+			if (v[i]) clz32 = 6'd31 - i[5:0];
+	end
+endfunction
+
+// ---- result ----------------------------------------------------------------
+assign sum = add_sum[31:0];
+
+assign log_o  = log_res;
+assign rot_o  = rot_res;
+assign clz_o  = {26'd0, clz32(a)};
+assign exts_o = ctl.ext_byte ? {{24{a[7]}}, a[7:0]} : {{16{a[15]}}, a[15:0]};
+
+always_comb begin
+	ca_out = add_sum[32];
+	ov_out = add_ov;
+	case (ctl.alu_op)
+		ALU_LOGIC: begin result = log_res; zero = ~(|log_res); neg = log_res[31]; end
+		ALU_ROT:   begin result = rot_res; ca_out = rot_ca; zero = ~(|rot_res); neg = rot_res[31]; end
+		ALU_CNTLZ: begin result = {26'd0, clz32(a)}; zero = a[31]; neg = 1'b0; end
+		ALU_EXTS:  begin
+			result = ctl.ext_byte ? {{24{a[7]}}, a[7:0]} : {{16{a[15]}}, a[15:0]};
+			zero   = ctl.ext_byte ? ~(|a[7:0]) : ~(|a[15:0]);
+			neg    = ctl.ext_byte ? a[7] : a[15];
+		end
+		default:   begin result = add_sum[31:0]; zero = ~(|add_sum[31:0]); neg = add_sum[31]; end
+	endcase
+end
+
+endmodule
