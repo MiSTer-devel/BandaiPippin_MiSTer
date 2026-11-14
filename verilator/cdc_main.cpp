@@ -1,4 +1,4 @@
-// Drives DSPPC604_memcdc with two unrelated clocks: random line and word
+// Drives DSPPC603_memcdc with two unrelated clocks: random line and word
 // requests on the CPU's side, a memory with random wait states on the
 // other, and a software copy of that memory to check every read against.
 //
@@ -9,7 +9,7 @@
 // pass; the two sides never see each other's clock.
 
 #include <verilated.h>
-#include "VDSPPC604_memcdc.h"
+#include "VDSPPC603_memcdc.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
 
 	auto ctx = std::make_unique<VerilatedContext>();
 	ctx->commandArgs(argc, argv);
-	auto dut = std::make_unique<VDSPPC604_memcdc>(ctx.get());
+	auto dut = std::make_unique<VDSPPC603_memcdc>(ctx.get());
 
 	std::mt19937 rng(seed);
 	const uint32_t SIZE = 1u << 16;

@@ -1,6 +1,6 @@
 //============================================================================
 //
-//  Synthesis-only wrapper for the area and timing check of the DSPPC604
+//  Synthesis-only wrapper for the area and timing check of the DSPPC603
 //  floating-point unit (syn/check.py fpu).
 //
 //  Operands arrive from registers through a forwarding multiplexer, as they
@@ -8,7 +8,7 @@
 //
 //============================================================================
 
-module DSPPC604_check_fpu
+module DSPPC603_check_fpu
 (
 	input  logic        clk,
 	input  logic        i_reset,
@@ -32,7 +32,7 @@ module DSPPC604_check_fpu
 	output logic        o_fex
 );
 
-import DSPPC604_pkg::*;
+import DSPPC603_pkg::*;
 
 logic        reset_q;
 logic        valid_q;
@@ -73,7 +73,7 @@ wire [63:0] op_b  = fwd_q[1] ? o_result : b_q;
 wire [63:0] op_c  = fwd_q[2] ? o_result : c_q;
 wire [31:0] op_fs = fwd_fpscr_q ? o_fpscr : fpscr_q;
 
-DSPPC604_fpu fpu
+DSPPC603_fpu fpu
 (
 	.clk        (clk),
 	.reset      (reset_q),
@@ -85,9 +85,9 @@ DSPPC604_fpu fpu
 	.a          (op_a),
 	.b          (op_b),
 	.c          (op_c),
-	.cls_a      (DSPPC604_pkg::fp_classify(op_a)),
-	.cls_b      (DSPPC604_pkg::fp_classify(op_b)),
-	.cls_c      (DSPPC604_pkg::fp_classify(op_c)),
+	.cls_a      (DSPPC603_pkg::fp_classify(op_a)),
+	.cls_b      (DSPPC603_pkg::fp_classify(op_b)),
+	.cls_c      (DSPPC603_pkg::fp_classify(op_c)),
 	.fpscr_in   (op_fs),
 	.resp_valid (resp_valid),
 	.resp_ready (1'b1),

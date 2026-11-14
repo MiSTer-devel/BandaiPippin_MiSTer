@@ -1,6 +1,6 @@
 /*
  * dingus_ref.h - C API around the dingusppc PowerPC interpreter, for running it
- * in lockstep with the DSPPC604 RTL in a Verilator test bench.
+ * in lockstep with the DSPPC603 RTL in a Verilator test bench.
  *
  * See README.md in this directory for semantics and caveats.
  */

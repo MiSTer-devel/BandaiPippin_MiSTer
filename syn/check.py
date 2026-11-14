@@ -2,7 +2,6 @@
 """Area and timing check of one CPU block on the DE10-Nano's FPGA.
 
     python syn/check.py core           the whole DSPPC603 (pipeline, FPU, MMU, caches)
-    python syn/check.py core --cpu 604 the same for DSPPC604
     python syn/check.py int            integer decode + execute path
     python syn/check.py fpu            floating-point unit
     python syn/check.py int --mhz 66   constrain to a different clock
@@ -17,10 +16,7 @@
                                        the slowest path into the registers
                                        matching each pattern, cell by cell
 
-The wrappers name DSPPC604's modules; for another CPU (--cpu, default 603)
-they are copied into the build directory with the names changed.
-
-Builds a throw-away Quartus project in syn/build/<cpu>/<target>, with every port
+Builds a throw-away Quartus project in syn/build/<target>, with every port
 except the clock as a virtual pin, compiles it (synthesis, fit, timing) and
 prints the resource use and Fmax. Needs Quartus 17.0 (Lite is enough).
 
@@ -36,7 +32,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CPU = "DSPPC603"                       # set from --cpu in main()
+CPU = "DSPPC603"
 QUARTUS_BIN = os.environ.get("QUARTUS_BIN", os.path.expanduser("~/intelFPGA_lite/17.0/quartus/bin"))
 DEVICE = "5CSEBA6U23I7"   # DE10-Nano
 
@@ -52,9 +48,9 @@ def cpu_sources():
 
 # top-level wrapper per target; unused CPU modules are simply dropped
 TARGETS = {
-    "int": "DSPPC604_check_int",
-    "fpu": "DSPPC604_check_fpu",
-    "core": "DSPPC604_check_core",
+    "int": "DSPPC603_check_int",
+    "fpu": "DSPPC603_check_fpu",
+    "core": "DSPPC603_check_core",
 }
 
 
@@ -63,14 +59,7 @@ def q(path):
 
 
 def write_project(top, mhz, build, retiming=True):
-    # the wrapper, its names changed to this CPU's
-    with open(os.path.join(HERE, top + ".sv")) as fh:
-        wrapper = fh.read().replace("DSPPC604", CPU)
-    top_cpu = top.replace("DSPPC604", CPU)
-    with open(os.path.join(build, top_cpu + ".sv"), "w") as fh:
-        fh.write(wrapper)
-    top = top_cpu
-    files = [os.path.join(rtl(), f) for f in cpu_sources()] + [os.path.join(build, top + ".sv")]
+    files = [os.path.join(rtl(), f) for f in cpu_sources()] + [os.path.join(HERE, top + ".sv")]
     for f in files:
         if not os.path.exists(f):
             sys.exit("missing source: " + f)
@@ -219,7 +208,6 @@ def detail_paths(top, build, count, to=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("target", choices=sorted(TARGETS))
-    ap.add_argument("--cpu", choices=("603", "604"), default="603", help="the CPU model (default 603)")
     ap.add_argument("--mhz", type=float, default=75.0, help="clock constraint (default 75)")
     ap.add_argument("--report-only", action="store_true", help="re-read the reports of the last run")
     ap.add_argument("--no-retiming", action="store_true", help="disable physical register retiming for an area/timing comparison")
@@ -229,14 +217,12 @@ def main():
                     help="also print the slowest path into the registers matching PATTERN cell by cell (repeatable)")
     args = ap.parse_args()
 
-    global CPU
-    CPU = "DSPPC" + args.cpu
-    top = TARGETS[args.target].replace("DSPPC604", CPU)
-    build = os.path.join(HERE, "build", args.cpu, args.target)
+    top = TARGETS[args.target]
+    build = os.path.join(HERE, "build", args.target)
     os.makedirs(build, exist_ok=True)
 
     if not args.report_only:
-        write_project(TARGETS[args.target], args.mhz, build, retiming=not args.no_retiming)
+        write_project(top, args.mhz, build, retiming=not args.no_retiming)
         exe = os.path.join(QUARTUS_BIN, "quartus_sh")
         log = os.path.join(build, "compile.log")
         print("compiling %s for %s at %.2f MHz (log: %s)" % (top, DEVICE, args.mhz, log))

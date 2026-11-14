@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Programs for the DSPPC604 pipeline test bench (core_tb).
+"""Programs for the DSPPC603 pipeline test bench (core_tb).
 
-    python progs.py golden OUT [results.csv]     the real-604 integer vectors as code
-    python progs.py goldenfp OUT [results.csv]   the real-604 floating-point vectors as code
+    python progs.py golden OUT [results.csv]     the real-603e integer vectors as code
+    python progs.py goldenfp OUT [results.csv]   the real-603e floating-point vectors as code
     python progs.py random OUT COUNT [SEED] [xlate]  random instruction stream for lockstep,
                                                  with address translation on if asked
     python progs.py fprandom OUT COUNT [SEED]    random floating-point program, with the
@@ -30,10 +30,6 @@ import csv
 import os
 import random
 import sys
-
-# the CPU model the programs are for: "604", or "603" (run_core.py --cpu
-# sets FPMODEL_CPU, which fpmodel.py reads too)
-CPU = os.environ.get("FPMODEL_CPU", "604")
 
 CODE_BASE = 0x00010000
 DATA_A = 0x00800000          # base register r1
@@ -334,19 +330,18 @@ def exctest(out):
     expect(mfspr(1009, 9), 0x00080000)                            # an SPR that does not exist (HID1 is the 604e's)
     expect(X(5, 0, 9, 150), 0x00080000)                           # stwcx without the dot: illegal on a 604
     expect(0xFC201090, 0)                                         # fmr with MSR[FP] off
-    if CPU == "603":
-        # the 603's SPR set (603e manual 2.1.2; PowerPC 603 Technical Summary
-        # Figure 2): the 604's performance monitor, DABR and PIR are not
-        # there; the table search registers are, HASH1 and HASH2 read-only;
-        # tlbld and tlbli are its own (no-ops until the software reload)
-        expect(mfspr(952, 9), 0x00080000)                         # MMCR0
-        expect(mfspr(1013, 9), 0x00080000)                        # DABR
-        expect(mtspr(978, 9), 0x00080000)                         # HASH1 cannot be written
-        no_exc(mfspr(978, 9))                                     # ... but read
-        p.words += li32(9, 0x12345678)
-        no_exc(mtspr(976, 9))                                     # DMISS
-        no_exc(X(0, 0, 9, 978))                                   # tlbld r9
-        no_exc(X(0, 0, 9, 1010))                                  # tlbli r9
+    # the 603's SPR set (603e manual 2.1.2; PowerPC 603 Technical Summary
+    # Figure 2): the 604's performance monitor, DABR and PIR are not
+    # there; the table search registers are, HASH1 and HASH2 read-only;
+    # tlbld and tlbli are its own (no-ops until the software reload)
+    expect(mfspr(952, 9), 0x00080000)                             # MMCR0
+    expect(mfspr(1013, 9), 0x00080000)                            # DABR
+    expect(mtspr(978, 9), 0x00080000)                             # HASH1 cannot be written
+    no_exc(mfspr(978, 9))                                         # ... but read
+    p.words += li32(9, 0x12345678)
+    no_exc(mtspr(976, 9))                                         # DMISS
+    no_exc(X(0, 0, 9, 978))                                       # tlbld r9
+    no_exc(X(0, 0, 9, 1010))                                      # tlbli r9
     setm(MSR_FP)
     expect(D(46, 29, 1, 2), 0, align_ea=DATA_A + 2)               # lmw at an odd address
     expect(D(47, 29, 1, 6), 0, align_ea=DATA_A + 6)               # stmw
@@ -354,38 +349,25 @@ def exctest(out):
     p.words += li32(8, 3)
     expect(X(2, 1, 8, 663), 0, align_ea=DATA_A + 3)               # stfsx
     # a string operation that is not word-aligned and crosses a 4 KB boundary,
-    # or is word-aligned and crosses a 256 MB boundary, is not performed either
-    # on the 604; the 603e performs them (its manual, 2.3.4.3.6 and 4.5.6), so
-    # there they are plain accesses (the 256 MB one left out: its store would
-    # reach 10000000, outside this program's memory)
-    string_align = CPU != "603"
+    # or is word-aligned and crosses a 256 MB boundary, is not performed by the
+    # 604; the 603e performs them (its manual, 2.3.4.3.6 and 4.5.6), so here
+    # they are plain accesses (the 256 MB one left out: its store would reach
+    # 10000000, outside this program's memory)
     p.words += li32(8, DATA_A + 0xFFE)
-    if string_align:
-        expect(X(29, 8, 4, 597), 0, align_ea=DATA_A + 0xFFE)      # lswi r29,r8,4: bytes FFE-1001
-    else:
-        no_exc(X(29, 8, 4, 597))
+    no_exc(X(29, 8, 4, 597))                                      # lswi r29,r8,4: bytes FFE-1001
     no_exc(X(29, 8, 2, 725))                                      # stswi r29,r8,2: ends at FFF
     p.words += li32(0, 0) + li32(9, 3) + [mtspr(XER, 9)]
-    if string_align:
-        expect(X(29, 8, 0, 533), 0, align_ea=DATA_A + 0xFFE, xer=3)   # lswx r29,r8,r0: XER says 3 bytes
-    else:
-        no_exc(X(29, 8, 0, 533), xer=3)
+    no_exc(X(29, 8, 0, 533), xer=3)                               # lswx r29,r8,r0: XER says 3 bytes
     p.words += li32(9, 2) + [mtspr(XER, 9)]
     no_exc(X(29, 8, 0, 661), xer=2)                               # stswx, 2 bytes
     p.words += li32(9, 0) + [mtspr(XER, 9)]
     p.words += li32(8, DATA_A + 0xFFC)
     no_exc(X(29, 8, 8, 597))                                      # lswi, word-aligned across 4 KB
-    if string_align:
-        p.words += li32(8, 0x0FFFFFFC)
-        expect(X(29, 8, 8, 725), 0, align_ea=0x0FFFFFFC)          # stswi across 256 MB
     setm(MSR_FP | MSR_PR)
     expect(X(9, 0, 0, 83), 0x00040000)                            # mfmsr in user mode
     expect(mfspr(SRR0, 9), 0x00040000)                            # a supervisor SPR in user mode
-    if CPU == "603":
-        expect(mfspr(1023, 9), 0x00080000)                        # PIR: not on a 603, so illegal as 1009 is on the 604 (not measured)
-        expect(X(0, 0, 9, 978), 0x00040000)                       # tlbld in user mode
-    else:
-        expect(mfspr(1023, 9), 0x00040000)                        # PIR too
+    expect(mfspr(1023, 9), 0x00080000)                            # PIR: not on a 603, so illegal as 1009 is on the 604 (not measured)
+    expect(X(0, 0, 9, 978), 0x00040000)                           # tlbld in user mode
     expect(mfspr(1009, 9), 0x00080000)                            # one that does not exist is illegal, not privileged (measured)
     no_exc(mfspr(268, 9))                                         # the time base through mfspr, in user mode
     expect(0x44000002, 0, pc_after=True)                          # sc from user mode
@@ -2303,7 +2285,7 @@ def specfetchrom(out):
 if __name__ == "__main__":
     here = os.path.dirname(os.path.abspath(__file__))
     a = sys.argv[1:]
-    default_csv = os.path.join(here, "..", "ppctest", "runs", "results_604_run2.csv")
+    default_csv = os.path.join(here, "..", "cputest", "runs", "results_603e_6300_run1.csv")
     if len(a) >= 2 and a[0] == "golden":
         golden(a[1], a[2] if len(a) > 2 else default_csv)
     elif len(a) >= 2 and a[0] == "goldenfp":

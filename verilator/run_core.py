@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Build and run the pipeline tests of a CPU model.
+"""Build and run the DSPPC603's pipeline tests.
 
-    python verilator/run_core.py              everything below, DSPPC603
-    python verilator/run_core.py --cpu 604    the same for DSPPC604
+    python verilator/run_core.py              everything below
     python verilator/run_core.py --seeds 100  more random programs
     python verilator/run_core.py --quick      a short run
 
-1. The real chip's integer vectors (the 603e run for DSPPC603, the 604 run
-   for DSPPC604), assembled into one program and executed by the pipeline,
-   without and with random bus wait states.
+1. The real chip's integer vectors (the 603e run), assembled into one
+   program and executed by the pipeline, without and with random bus wait
+   states.
 2. Its floating-point vectors, the same way.
 3. Random floating-point programs (arithmetic, loads, stores, FPSCR
    instructions) with the state fpmodel.py expects after every instruction.
@@ -39,9 +38,9 @@ sys.path.insert(0, HERE)
 from run import DEFAULT_CSV, build_dir   # noqa: E402
 
 
-def completion_queue(cpu):
+def completion_queue():
     """Whether the CPU is built with its completion queue (its top's default)."""
-    top = os.path.join(HERE, "..", "rtl", "DSPPC" + cpu, "DSPPC" + cpu + ".sv")
+    top = os.path.join(HERE, "..", "rtl", "DSPPC603", "DSPPC603.sv")
     return int(re.search(r"parameter int\s+COMPLETION_ALU\s*=\s*(\d+)", open(top).read()).group(1))
 
 
@@ -51,7 +50,6 @@ def run(cmd, **kw):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cpu", choices=("603", "604"), default="603", help="the CPU model (default 603)")
     ap.add_argument("--seeds", type=int, default=20, help="random programs to run (default 20)")
     ap.add_argument("--count", type=int, default=20000, help="instructions per random program")
     ap.add_argument("--first-seed", type=int, default=1)
@@ -60,13 +58,12 @@ def main():
     if args.quick:
         args.seeds = 4
 
-    COMPLETION_QUEUE = completion_queue(args.cpu)
-    os.environ["FPMODEL_CPU"] = args.cpu        # progs.py's programs expect this CPU's FPU (fpmodel.py)
+    COMPLETION_QUEUE = completion_queue()
     cache = os.path.join(os.path.expanduser("~"), ".cache", "applepippin")
-    build = build_dir(args.cpu)
+    build = build_dir()
     dingus = os.environ.get("DINGUS") or os.path.join(cache, "dingusppc")
-    csv = os.path.abspath(DEFAULT_CSV[args.cpu])
-    chip = {"603": "603e", "604": "604"}[args.cpu]
+    csv = os.path.abspath(DEFAULT_CSV)
+    chip = "603e"
     # the compilers' temporary files go in a directory of this build's own:
     # other WSL sessions working at the same time have deleted files in /tmp
     # under a running g++
@@ -84,7 +81,7 @@ def main():
         print("building the dingusppc reference failed")
         return 1
     lib = os.path.join(refdir, "libdingusref.a")
-    r = run(["make", "-s", "-C", HERE, "core", "BUILD=" + build, "REF_LIB=" + lib, "CPU=" + args.cpu])
+    r = run(["make", "-s", "-C", HERE, "core", "BUILD=" + build, "REF_LIB=" + lib])
     if r.returncode:
         print(r.stdout)
         print("building the test bench failed")
@@ -243,7 +240,7 @@ def main():
 
     # Checked mixes exercise the completion FIFO's simultaneous append/pop,
     # wraparound and younger writes replacing a pending long-unit destination.
-    # (the queue is optional, DSPPC604's COMPLETION_QUEUE; without it the
+    # (the queue is optional, DSPPC603's COMPLETION_QUEUE; without it the
     # mixes still run in lockstep, and nothing is required to overlap)
     r = run([sys.executable, os.path.join(HERE, "perf.py"), "--tb", tb,
              "--out", os.path.join(progs, "perf"), "--loops", "100", "--lockstep"] +
@@ -251,7 +248,7 @@ def main():
     report("checked execution-overlap mixes", r)
 
     # 6. the memory port across two clocks
-    r = run(["make", "-s", "-C", HERE, "cdc", "BUILD=" + build, "CPU=" + args.cpu])
+    r = run(["make", "-s", "-C", HERE, "cdc", "BUILD=" + build])
     if r.returncode:
         print(r.stdout)
         print("building the clock-crossing bench failed")

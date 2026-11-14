@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Bit-exact software model of the PowerPC 604 and 603 floating-point units.
+"""Bit-exact software model of the PowerPC 603's floating-point unit.
 
-The executable specification for DSPPC604_fpu and DSPPC603_fpu. It is written
-for clarity, with exact integer arithmetic, and is checked against the vectors
-recorded on a real 604 (two runs on a Power Macintosh 7600, one on a 7300; the
-7300 run covers non-IEEE mode, the enabled exceptions, the loads and stores
-and the FPSCR instructions) and on a real 603e (a Performa 6300):
+The executable specification for DSPPC603_fpu. It is written for clarity,
+with exact integer arithmetic, and is checked against the vectors recorded on
+a real 603e (a Performa 6300). It began as a model of the 604's unit, checked
+against a real 604 (Power Macintosh 7600 and 7300 runs), and keeps the 604's
+behaviour wherever the 603e has not been measured to differ:
 
     python fpmodel.py check [results.csv]      compare with real-hardware data
     python fpmodel.py random N SEED x.csv      vectors with modelled results,
                                                in the same CSV format
-    python fpmodel.py --cpu 603 ...            the 603's unit (see CPU below)
 
 The random vectors exercise datapath corners the hardware set does not reach;
 replay them with `run.py --csv x.csv`.
@@ -32,16 +31,11 @@ VE, OE, UE, ZE, XE, NI, RN = 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x03
 VX_ALL = VXSNAN | VXISI | VXIDI | VXZDZ | VXIMZ | VXVC | VXSOFT | VXSQRT | VXCVI
 STICKY = OX | UX | ZX | XX | VX_ALL
 
-# Which unit is modelled: "604", or "603", whose single-precision multiply
-# (fmuls and the fmadds family) uses frC's significand rounded to 25 bits,
-# a half rounded up (measured on a 603e: docs/DSPPC603_notes.md). The
-# environment's FPMODEL_CPU sets it for programs that import this module.
-CPU = os.environ.get("FPMODEL_CPU", "604")
-
-
 def c_operand(mc, ec, single):
-    """frC's significand as the multiplier uses it."""
-    if CPU != "603" or not single:
+    """frC's significand as the multiplier uses it: in a single-precision
+    multiply (fmuls and the fmadds family) rounded to 25 bits, a half rounded
+    up (measured on a 603e: docs/DSPPC603_notes.md)."""
+    if not single:
         return mc, ec
     k = mc.bit_length() - 25                # bits below the 25 kept
     if k <= 0:
@@ -565,14 +559,13 @@ def single_to_double(w):
 
 
 def double_to_single(d):
-    """stfs: no rounding. A value whose exponent field is 896 or less is
+    """stfs: no rounding. A value whose exponent field is 874 to 896 is
     denormalised: the 24-bit significand is shifted right by 897 - exponent
-    places and truncated, so below the single denormal range (exponent 873
-    and under, double denormals included) a signed zero is stored. Anything
-    else stores its top bits. The architecture leaves exponents below 874
-    undefined; the shift to zero is what the 604 does (7300 run, 92 vectors)."""
+    places and truncated. The architecture leaves exponents below 874
+    undefined; the 604 stores a signed zero there (7300 run, 92 vectors), the
+    603e does not (below). Anything else stores its top bits."""
     s, e, f = d >> 63, (d >> 52) & 0x7FF, d & FRAC
-    if CPU == "603" and e < 874:
+    if e < 874:
         # The 603e (378 vectors): below the single denormal range the bits
         # are stored as for a normal number, a double denormal as though
         # its exponent field were 1.
@@ -793,11 +786,7 @@ def gen_random(count, seed, out=sys.stdout):
 
 if __name__ == "__main__":
     here = os.path.dirname(os.path.abspath(__file__))
-    if len(sys.argv) >= 3 and sys.argv[1] == "--cpu":
-        CPU = sys.argv[2]
-        del sys.argv[1:3]
-    default = os.path.join(here, "..", "ppctest", "runs", "results_604_run2.csv") if CPU == "604" else \
-        os.path.join(here, "..", "cputest", "runs", "results_603e_6300_run1.csv")
+    default = os.path.join(here, "..", "cputest", "runs", "results_603e_6300_run1.csv")
     if len(sys.argv) >= 2 and sys.argv[1] == "check":
         rest = sys.argv[2:]
         path = rest[0] if rest and rest[0].endswith(".csv") else default

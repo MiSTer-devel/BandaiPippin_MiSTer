@@ -1,6 +1,6 @@
 //============================================================================
 //
-//  Synthesis-only wrapper for the area and timing check of the DSPPC604
+//  Synthesis-only wrapper for the area and timing check of the DSPPC603
 //  pipeline (syn/check.py core).
 //
 //  The memory and snoop ports are registered here, standing in for the
@@ -9,7 +9,7 @@
 //
 //============================================================================
 
-module DSPPC604_check_core
+module DSPPC603_check_core
 (
 	input  logic         clk,
 	input  logic         i_reset,
@@ -66,7 +66,7 @@ always_ff @(posedge clk) begin
 end
 
 /* verilator lint_off PINCONNECTEMPTY */
-DSPPC604 cpu
+DSPPC603 cpu
 (
 	.clk           (clk),
 	.reset         (reset_q),

@@ -1,4 +1,4 @@
-// Runs a program on the DSPPC604 pipeline and checks it in up to three ways:
+// Runs a program on the DSPPC603 pipeline and checks it in up to three ways:
 //
 //   C records in the program file: the architectural state after a given
 //       instruction retires must equal recorded values (golden vectors from a
@@ -9,7 +9,7 @@
 //
 // Built two ways from this one file:
 //
-//   core_tb     the CPU alone (top DSPPC604), with a memory model on its
+//   core_tb     the CPU alone (top DSPPC603), with a memory model on its
 //               line port (random wait states; at the end every line the
 //               data cache may hold dirty is written back through the snoop
 //               port), running a program file.
@@ -39,9 +39,9 @@
 #include "VPippin_system___024root.h"
 typedef VPippin_system Top;
 #else
-#include "VDSPPC604.h"
-#include "VDSPPC604___024root.h"
-typedef VDSPPC604 Top;
+#include "VDSPPC603.h"
+#include "VDSPPC603___024root.h"
+typedef VDSPPC603 Top;
 #endif
 
 #include <cstdarg>
@@ -70,15 +70,8 @@ typedef VDSPPC604 Top;
 namespace {
 
 // the CPU's processor version, as the reference is started with it (the
-// Makefile's CPU_MODEL: 604 or 603; each the RTL's PVR parameter)
-#ifndef CPU_MODEL
-#define CPU_MODEL 604
-#endif
-#if CPU_MODEL == 603
-const uint32_t PVR_604  = 0x00030100;
-#else
-const uint32_t PVR_604  = 0x00040303;
-#endif
+// RTL's PVR parameter: a 603)
+const uint32_t PVR  = 0x00030100;
 
 #ifdef PIPPIN_MACHINE
 // the machine's SDRAM board (--module), the ROM in its top 4 MB (rom_at)
@@ -730,7 +723,7 @@ void dev_write(void* ctx, uint32_t addr, unsigned size, uint32_t value) {
 
 } // namespace
 
-// The CPU's performance counters (DSPPC604's perf_cnt, PERF): the cycle
+// The CPU's performance counters (DSPPC603's perf_cnt, PERF): the cycle
 // accounting. Every cycle either sees an operation leave EX or falls in one
 // of the twelve wait classes, so the classes are printed per 100 cycles.
 static void print_perf(const Top* dut) {
@@ -999,7 +992,7 @@ int main(int argc, char** argv) {
 #ifdef PIPPIN_MACHINE
 		// Aspen's banks and windows, the ROM, and everything else (the RAM's holes too)
 		// answered by the core's machine
-		if (ref_init_map(RAM_SIZE, PVR_604) != 0) { std::fprintf(stderr, "reference model failed to start\n"); return 2; }
+		if (ref_init_map(RAM_SIZE, PVR) != 0) { std::fprintf(stderr, "reference model failed to start\n"); return 2; }
 		std::vector<std::pair<uint32_t, uint32_t>> mapped;      // [start, end) of RAM and windows
 		bool map_ok = true;
 		for (unsigned n = 0; n < 4 && map_ok; n++) {
@@ -1029,7 +1022,7 @@ int main(int argc, char** argv) {
 		}
 		std::memcpy(ref_ram(), mem.data(), RAM_SIZE);     // the RAM as the core starts with it (--ram-fill too)
 #else
-		if (ref_init(RAM_SIZE, PVR_604) != 0) { std::fprintf(stderr, "reference model failed to start\n"); return 2; }
+		if (ref_init(RAM_SIZE, PVR) != 0) { std::fprintf(stderr, "reference model failed to start\n"); return 2; }
 		std::memcpy(ref_ram(), mem.data(), RAM_SIZE);
 #endif
 		ref_state_t s{};
@@ -1075,7 +1068,7 @@ int main(int argc, char** argv) {
 		if (dut->cpu_in_reset) return;
 		uint32_t e = dut->rootp->Pippin_system__DOT__cpu__DOT__perf_events;
 #else
-		uint32_t e = dut->rootp->DSPPC604__DOT__perf_events;
+		uint32_t e = dut->rootp->DSPPC603__DOT__perf_events;
 #endif
 		perf_cycles++;
 		for (int i = 0; i < 20; i++) perf_events[i] += (e >> i) & 1;
@@ -1995,19 +1988,13 @@ int main(int argc, char** argv) {
 						}
 						uint32_t xo = (w >> 1) & 0x3FF;
 						unsigned spr = ((w >> 16) & 31) | (((w >> 11) & 31) << 5);
-						// the SPRs the CPU has (dingusppc accepts any): the 604's as measured; the
-						// 603's as DSPPC603 has them (docs/DSPPC603_notes.md: no performance
-						// monitor, DABR or PIR; the table search registers, HASH1 and HASH2
-						// read-only), which the NanoKernel probes for by writing and reading back
-#if CPU_MODEL == 603
+						// the SPRs the CPU has (dingusppc accepts any): the 603's as DSPPC603 has
+						// them (docs/DSPPC603_notes.md: no performance monitor, DABR or PIR; the
+						// table search registers, HASH1 and HASH2 read-only), which the
+						// NanoKernel probes for by writing and reading back
 						static const unsigned spr_set[] = {1, 8, 9, 18, 19, 22, 25, 26, 27, 268, 269, 272, 273, 274, 275, 282,
 						                                   284, 285, 287, 976, 977, 980, 981, 982, 1008, 1010};
 						bool has = (spr >= 528 && spr <= 543) || ((spr == 978 || spr == 979) && xo == 339);
-#else
-						static const unsigned spr_set[] = {1, 8, 9, 18, 19, 22, 25, 26, 27, 268, 269, 272, 273, 274, 275, 282,
-						                                   284, 285, 287, 952, 953, 954, 955, 959, 1008, 1010, 1013, 1023};
-						bool has = spr >= 528 && spr <= 543;
-#endif
 						for (unsigned s : spr_set) has = has || s == spr;
 						if (known && (w >> 26) == 31 && (xo == 467 || xo == 339) && !has) {
 							uint32_t at = before.pc;
@@ -2019,8 +2006,8 @@ int main(int argc, char** argv) {
 							ref_set_state(&t);
 							ref_get_state(&before);
 							if (illegal_spr_notes++ < 10)
-								std::printf("note: %s of SPR %u at %08X after %llu instructions: a program exception on a %d\n",
-									xo == 467 ? "mtspr" : "mfspr", spr, at, (unsigned long long)retired, CPU_MODEL);
+								std::printf("note: %s of SPR %u at %08X after %llu instructions: a program exception on a 603\n",
+									xo == 467 ? "mtspr" : "mfspr", spr, at, (unsigned long long)retired);
 						}
 					}
 #endif
@@ -2192,13 +2179,11 @@ int main(int argc, char** argv) {
 							ref_set_state(&s);
 						}
 					}
-					// rfi: a 604 copies SRR1's low 16 bits into MSR, PM (bit 29)
-					// among them (measured: README, MSR keeps 0005FF77 and rfi the
-					// low 16); dingusppc's ppc_rfi leaves PM alone (its mask is
-					// 0x87C0FF73). The NanoKernel returns to Mac OS with PM set.
-					// (a 603 has no PM: its rfi clears it)
+					// rfi: a 603 has no PM (MSR bit 29), so its rfi clears it;
+					// dingusppc's ppc_rfi leaves PM alone (its mask is 0x87C0FF73),
+					// and the NanoKernel returns to Mac OS with PM set.
 					if (insn == 0x4C000064u && rc == 0) {
-						s.msr = (s.msr & ~4u) | (CPU_MODEL == 603 ? 0u : (ref_get_spr(27) & 4u));
+						s.msr &= ~4u;
 						ref_set_state(&s);
 					}
 #ifdef PIPPIN_MACHINE

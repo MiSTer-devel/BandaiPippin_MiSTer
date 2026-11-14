@@ -1,5 +1,5 @@
 // Replays single-instruction golden vectors from a real PowerPC against the
-// DSPPC604 execute units (through vector_dut) and reports every difference.
+// DSPPC603 execute units (through vector_dut) and reports every difference.
 // (The Makefile builds it for DSPPC603 the same way, with the names changed.)
 //
 // The vectors are the CSV written by `ppctest.py results`: the out_* columns
@@ -46,7 +46,7 @@ struct Tally {
 };
 
 struct Options {
-	std::string csv = "../ppctest/runs/results_604_run2.csv";
+	std::string csv = "../cputest/runs/results_603e_6300_run1.csv";
 	std::string only;                  // "", "int" or "fp"
 	std::vector<std::string> names;    // empty: all
 	long show = 4;                     // failures printed per instruction
@@ -206,7 +206,7 @@ void print_failure(const Vector& v, const std::vector<Diff>& diffs, bool unimpl,
 void usage() {
 	std::printf(
 		"usage: vector_tb [options]\n"
-		"  --csv FILE     golden results (default ../ppctest/runs/results_604_run2.csv)\n"
+		"  --csv FILE     golden results (default ../cputest/runs/results_603e_6300_run1.csv)\n"
 		"  --only int|fp  integer or floating-point vectors only\n"
 		"  --name A,B,..  only these instructions (ADDE matches ADDE, ADDE., ADDEO, ADDEO.)\n"
 		"  --show N       failures printed per instruction (default 4, 0 for none)\n"

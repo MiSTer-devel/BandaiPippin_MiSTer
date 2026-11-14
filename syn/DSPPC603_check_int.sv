@@ -1,6 +1,6 @@
 //============================================================================
 //
-//  Synthesis-only wrapper for the area and timing check of the DSPPC604
+//  Synthesis-only wrapper for the area and timing check of the DSPPC603
 //  integer path (syn/check.py int).
 //
 //  Models how the pipeline will use the units: a registered instruction is
@@ -10,7 +10,7 @@
 //
 //============================================================================
 
-module DSPPC604_check_int
+module DSPPC603_check_int
 (
 	input  logic        clk,
 	input  logic        i_reset,
@@ -34,7 +34,7 @@ module DSPPC604_check_int
 	output logic        o_so
 );
 
-import DSPPC604_pkg::*;
+import DSPPC603_pkg::*;
 
 // ---- input registers (keep the pins out of the timing paths) ---------------
 logic        reset_q;
@@ -66,7 +66,7 @@ end
 // ---- decode stage ----------------------------------------------------------
 dec_t dec;
 
-DSPPC604_decode decode
+DSPPC603_decode decode
 (
 	.insn (insn_q),
 	.dec  (dec)
@@ -113,7 +113,7 @@ wire [31:0] op_b = (ex_fwd_b == 2'd1) ? o_result : (ex_fwd_b == 2'd2) ? ex_wb : 
 wire        ca_in = ex_fwd_xer ? o_ca : ex_ca;
 wire        so_in = ex_fwd_xer ? o_so : ex_so;
 
-DSPPC604_int_unit int_unit
+DSPPC603_int_unit int_unit
 (
 	.clk        (clk),
 	.reset      (reset_q),

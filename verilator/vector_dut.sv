@@ -47,7 +47,7 @@ module vector_dut
 	output logic [63:0] out_f6
 );
 
-import DSPPC604_pkg::*;
+import DSPPC603_pkg::*;
 
 // ---- architectural state ---------------------------------------------------
 logic [31:0] gpr [32];
@@ -64,7 +64,7 @@ wire xer_ca = xer[29];
 // ---- decode ----------------------------------------------------------------
 dec_t dec;
 
-DSPPC604_decode decode
+DSPPC603_decode decode
 (
 	.insn (insn_q),
 	.dec  (dec)
@@ -102,7 +102,7 @@ logic [3:0]  int_cr;
 logic        int_ready;
 /* verilator lint_on UNUSEDSIGNAL */
 
-DSPPC604_int_unit int_unit
+DSPPC603_int_unit int_unit
 (
 	.clk        (clk),
 	.reset      (reset),
@@ -149,7 +149,7 @@ always_ff @(posedge clk) begin
 	if (fpu_resp | (state != S_EXEC) | reset) fpu_taken <= 1'b0;
 end
 generate if (HAVE_FPU != 0) begin : g_fpu
-	DSPPC604_fpu fpu
+	DSPPC603_fpu fpu
 	(
 		.clk        (clk),
 		.reset      (reset),
@@ -162,9 +162,9 @@ generate if (HAVE_FPU != 0) begin : g_fpu
 		.a          (fop_a),
 		.b          (fop_b),
 		.c          (fop_c),
-		.cls_a      (DSPPC604_pkg::fp_classify(fop_a)),
-		.cls_b      (DSPPC604_pkg::fp_classify(fop_b)),
-		.cls_c      (DSPPC604_pkg::fp_classify(fop_c)),
+		.cls_a      (DSPPC603_pkg::fp_classify(fop_a)),
+		.cls_b      (DSPPC603_pkg::fp_classify(fop_b)),
+		.cls_c      (DSPPC603_pkg::fp_classify(fop_c)),
 		.fpscr_in   (fpscr),
 		.resp_valid (fpu_resp),
 		/* verilator lint_off PINCONNECTEMPTY */
